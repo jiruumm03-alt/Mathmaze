@@ -11,24 +11,26 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// ✅ Health check route for Render
+app.get('/', (req, res) => {
+  res.status(200).send('✅ MathMaze API is live and healthy!');
+});
+
 const DB_HOST = process.env.DB_HOST || 'localhost';
 const DB_USER = process.env.DB_USER || 'root';
 const DB_PASSWORD = process.env.DB_PASSWORD || '';
 const DB_NAME = process.env.DB_NAME || 'mathmaze_db';
 
-const fs = require('fs');
 const db = mysql.createPool({
   host: DB_HOST,
   user: DB_USER,
   password: DB_PASSWORD,
   database: DB_NAME,
-  port: process.env.DB_PORT,
+  port: DB_PORT,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  ssl: {
-    ca: fs.readFileSync('./certs/ca.pem')
-  }
+  ssl: { rejectUnauthorized: true } // Aiven supports this default SSL
 });
 
 // Helper: allow grade only 3-6
