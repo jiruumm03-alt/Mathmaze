@@ -8,7 +8,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   $username = $_POST['username'] ?? '';
   $password = $_POST['password'] ?? '';
   $grade = intval($_POST['grade'] ?? 0);
-  $table = "grade" . $grade . "_teachers";
+  $table = "mathmaze_db.grade" . $grade . "_teachers";
 
   if ($grade < 3 || $grade > 6) {
     $msg = 'Invalid grade selected.';
