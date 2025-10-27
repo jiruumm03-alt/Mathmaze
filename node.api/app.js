@@ -1,6 +1,10 @@
 // app.js - MathMaze Node.js API (Express)
 // Usage: set environment variables in .env or platform settings:
 // DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, PORT (optional)
+const dotenv = require("dotenv");
+dotenv.config();
+
+
 const express = require('express');
 const mysql = require('mysql2');
 const bcrypt = require("bcryptjs");
@@ -16,21 +20,16 @@ app.get('/', (req, res) => {
   res.status(200).send('✅ MathMaze API is live and healthy!');
 });
 
-const DB_HOST = process.env.DB_HOST || 'localhost';
-const DB_USER = process.env.DB_USER || 'root';
-const DB_PASSWORD = process.env.DB_PASSWORD || '';
-const DB_NAME = process.env.DB_NAME || 'mathmaze_db';
-
 const db = mysql.createPool({
-  host: DB_HOST,
-  user: DB_USER,
-  password: DB_PASSWORD,
-  database: DB_NAME,
-  port: DB_PORT,
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'mathmaze_db',
+  port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3306,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  ssl: { rejectUnauthorized: true } // Aiven supports this default SSL
+  ssl: { rejectUnauthorized: true }
 });
 
 // Helper: allow grade only 3-6
