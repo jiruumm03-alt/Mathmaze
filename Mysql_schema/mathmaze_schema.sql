@@ -5,55 +5,36 @@ CREATE DATABASE IF NOT EXISTS mathmaze_db;
 USE mathmaze_db;
 
 
-CREATE TABLE IF NOT EXISTS grade3_students (
+-- Students table (all grades)
+CREATE TABLE IF NOT EXISTS students (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  full_name VARCHAR(100),
+  age INT,
+  grade_level INT NOT NULL CHECK (grade_level IN (3, 4, 5, 6)),
+  INDEX idx_grade_level (grade_level)
+);
+
+-- Progress tracking (all grades)
+CREATE TABLE IF NOT EXISTS progress (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  student_id INT NOT NULL,
+  level INT,
+  score INT,
+  time_spent FLOAT,
+  date_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+  INDEX idx_student_id (student_id),
+  INDEX idx_student_level (student_id, level)
+);
+
+-- Teachers table (all grades)
+CREATE TABLE IF NOT EXISTS teachers (
   id INT AUTO_INCREMENT PRIMARY KEY,
   username VARCHAR(50) UNIQUE,
   password VARCHAR(255),
   full_name VARCHAR(100),
-  grade_level INT DEFAULT 3
-);
-CREATE TABLE IF NOT EXISTS grade4_students LIKE grade3_students;
-CREATE TABLE IF NOT EXISTS grade5_students LIKE grade3_students;
-CREATE TABLE IF NOT EXISTS grade6_students LIKE grade3_students;
-
--- Progress per grade
-CREATE TABLE IF NOT EXISTS grade3_progress (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  student_id INT,
-  level INT,
-  score INT,
-  time_spent FLOAT,
-  date_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (student_id) REFERENCES grade3_students(id)
-);
-CREATE TABLE IF NOT EXISTS grade4_progress LIKE grade3_progress;
-CREATE TABLE IF NOT EXISTS grade5_progress LIKE grade3_progress;
-CREATE TABLE IF NOT EXISTS grade6_progress LIKE grade3_progress;
-
--- Teachers per grade (for dashboard login)
-CREATE TABLE IF NOT EXISTS grade3_teachers (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  username VARCHAR(50) UNIQUE,
-  password VARCHAR(255),
-  full_name VARCHAR(100)
-);
-CREATE TABLE IF NOT EXISTS grade4_teachers (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  username VARCHAR(50) UNIQUE,
-  password VARCHAR(255),
-  full_name VARCHAR(100)
-);
-CREATE TABLE IF NOT EXISTS grade5_teachers (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  username VARCHAR(50) UNIQUE,
-  password VARCHAR(255),
-  full_name VARCHAR(100)
-);
-CREATE TABLE IF NOT EXISTS grade6_teachers (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  username VARCHAR(50) UNIQUE,
-  password VARCHAR(255),
-  full_name VARCHAR(100)
+  grade_level INT NOT NULL CHECK (grade_level IN (3, 4, 5, 6)),
+  INDEX idx_grade_level (grade_level)
 );
 
 -- Example: create a sample teacher (change password)
