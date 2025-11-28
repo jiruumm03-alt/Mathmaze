@@ -1,0 +1,1 @@
+SELECT * FROM mathmaze_db.grade6_teachers;
