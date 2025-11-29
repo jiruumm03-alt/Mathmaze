@@ -21,11 +21,11 @@ app.get('/', (req, res) => {
 });
 
 const db = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
+  host: process.env.DB_HOST || 'mysql-178347b3-jiruumm03-9e90.f.aivencloud.com',
+  user: process.env.DB_USER || 'avnadmin',
   password: process.env.DB_PASSWORD || '',
   database: process.env.DB_NAME || 'mathmaze_db',
-  port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3306,
+  port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 26168,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
