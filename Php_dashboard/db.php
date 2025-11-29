@@ -12,7 +12,6 @@ $DEFAULT_DB = [
     'DB_PASS' => '',
     'DB_CHARSET' => 'utf8mb4'
 ];
-// ---------------------------
 
 function load_dotenv($path = __DIR__ . '/.env') {
     if (!file_exists($path)) return [];
