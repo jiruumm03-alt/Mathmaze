@@ -1,5 +1,5 @@
 <?php
-// login.php - fully restyled (inline CSS)
+// login.php - fully restyled center box only
 require_once __DIR__ . '/db.php';
 session_start();
 
@@ -28,6 +28,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stmt = pdo()->prepare("SELECT id, username, password, full_name, grade_level FROM teachers WHERE username = :u LIMIT 1");
         $stmt->execute([':u' => $u]);
         $t = $stmt->fetch();
+
         if ($t && password_verify($p, $t['password'])) {
             $_SESSION['user'] = [
                 'id'=>$t['id'],'username'=>$t['username'],'name'=>$t['full_name'],'role'=>'teacher','grade_level'=>$t['grade_level']
@@ -43,55 +44,139 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Login</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-  /* Inline theme (purple gradient) */
-  *{box-sizing:border-box;margin:0;padding:0;font-family:"Poppins",Arial,sans-serif}
-  body{min-height:100vh;display:flex;flex-direction:column;background:#f4f6f8;color:#222}
-  .navbar{display:flex;align-items:center;gap:12px;padding:14px 20px;background:linear-gradient(135deg,#4f46e5,#9333ea);color:#fff;box-shadow:0 3px 12px rgba(0,0,0,.12)}
-  .navbar img{width:34px;height:34px;border-radius:6px}
-  .navbar h1{font-size:18px;font-weight:600;letter-spacing:0.6px}
-  .container{flex:1;display:flex;align-items:center;justify-content:center;padding:40px 18px}
-  .card{background:#fff;width:100%;max-width:420px;padding:32px;border-radius:12px;box-shadow:0 8px 30px rgba(13,38,76,0.06);animation:fadeIn .55s ease}
-  h2{font-size:20px;margin-bottom:14px;color:#111;text-align:center}
-  label{display:block;font-size:13px;color:#444;margin-top:10px}
-  input{width:100%;padding:10px 12px;margin-top:6px;border:1px solid #dfe7f3;border-radius:8px;font-size:15px}
-  input:focus{outline:none;box-shadow:0 0 0 4px rgba(124,58,237,0.08);border-color:#7c3aed}
-  button{width:100%;padding:12px;margin-top:16px;border-radius:8px;border:0;background:linear-gradient(135deg,#4f46e5,#9333ea);color:#fff;font-size:16px;cursor:pointer}
-  .error{color:#b91c1c;background:#fff5f5;padding:10px;border-radius:8px;margin-bottom:10px;text-align:center}
-  .small{font-size:13px;color:#666;margin-top:12px;text-align:center}
-  @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-  @media (max-width:480px){.card{padding:22px}}
-  </style>
+<meta charset="utf-8">
+<title>Login</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:"Poppins",Arial,sans-serif}
+body{
+    min-height:100vh;
+    background:#f4f6f8;
+    display:flex;
+    flex-direction:column;
+}
+
+/* NAVBAR stays the same (your theme) */
+.navbar{
+    display:flex;
+    align-items:center;
+    gap:12px;
+    padding:14px 20px;
+    background:linear-gradient(135deg,#4f46e5,#9333ea);
+    color:#fff;
+    box-shadow:0 3px 12px rgba(0,0,0,.12);
+}
+.navbar img{width:34px;height:34px;border-radius:6px}
+.navbar h1{font-size:18px;font-weight:600;letter-spacing:0.6px}
+
+/* CENTER AREA — Facebook styling */
+.container{
+    flex:1;
+    display:flex;
+    justify-content:center;
+    align-items:flex-start;
+    padding-top:60px;
+}
+
+/* FACEBOOK STYLE LOGIN BOX */
+.card{
+    background:#fff;
+    width:100%;
+    max-width:380px;
+    padding:28px 24px;
+    border-radius:10px;
+    box-shadow:0 2px 10px rgba(0,0,0,0.15);
+    text-align:center;
+}
+
+/* Title like Facebook */
+.login-title{
+    font-size:20px;
+    font-weight:600;
+    color:#1c1e21;
+    margin-bottom:20px;
+}
+
+/* Inputs identical spacing as FB */
+input{
+    width:100%;
+    padding:14px;
+    font-size:15px;
+    margin-bottom:12px;
+    border:1px solid #ccd0d5;
+    border-radius:6px;
+}
+input:focus{
+    border-color:#4f46e5;
+    box-shadow:0 0 0 2px rgba(79,70,229,0.2);
+    outline:none;
+}
+
+/* Button same shape as FB but purple */
+button{
+    width:100%;
+    padding:14px;
+    font-size:17px;
+    font-weight:600;
+    color:#fff;
+    border:none;
+    border-radius:6px;
+    background:linear-gradient(135deg,#4f46e5,#9333ea);
+    cursor:pointer;
+}
+button:hover{
+    opacity:.9;
+}
+
+/* error */
+.error{
+    background:#ffecec;
+    color:#c00;
+    padding:10px;
+    border-radius:6px;
+    margin-bottom:12px;
+    font-size:14px;
+}
+
+/* tiny bottom text */
+.small{
+    margin-top:15px;
+    font-size:13px;
+    color:#555;
+}
+</style>
 </head>
+
 <body>
-  <header class="navbar">
-    <img src="favicon-32x32.png" alt="logo" onerror="this.style.display='none'">
-    <h1>MathMaze Panel</h1>
-  </header>
 
-  <main class="container">
-    <section class="card" aria-labelledby="loginTitle">
-      <h2 id="loginTitle">Sign in — Admin & Teacher</h2>
+<header class="navbar">
+  <img src="favicon-32x32.png" alt="logo">
+  <h1>MathMaze Panel</h1>
+</header>
 
-      <?php if($err): ?>
-        <div class="error" role="alert"><?=htmlspecialchars($err)?></div>
-      <?php endif; ?>
+<main class="container">
 
-      <form method="post" novalidate>
-        <label for="username">Username</label>
-        <input id="username" name="username" placeholder="Enter username" required autofocus>
+  <section class="card">
 
-        <label for="password">Password</label>
-        <input id="password" type="password" name="password" placeholder="Enter password" required>
+    <div class="login-title">Log in to MathMaze</div>
 
-        <button type="submit">Login</button>
-      </form>
+    <?php if($err): ?>
+      <div class="error"><?=htmlspecialchars($err)?></div>
+    <?php endif; ?>
 
-      <div class="small">First time? Create a super_admin in DB or ask existing admin to add you.</div>
-    </section>
-  </main>
+    <form method="post">
+      <input name="username" placeholder="Email or username" required autofocus>
+      <input type="password" name="password" placeholder="Password" required>
+
+      <button type="submit">Log In</button>
+    </form>
+
+    <div class="small">First time? Ask an admin to create your account.</div>
+
+  </section>
+
+</main>
+
 </body>
 </html>

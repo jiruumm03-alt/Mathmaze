@@ -1,371 +1,730 @@
 <?php
-// dashboard_teacher.php — teacher dashboard with analytics + printable report
+// dashboard_teacher.php — Teacher dashboard with Assignments (teacher-only) + Reports
 require_once __DIR__ . '/auth.php';
 require_login();
-if (!is_teacher() && !is_admin()) die("Access denied.");
+
+// Allow access only to teachers or admins (admins can also view teacher dashboard if needed)
+if (!is_teacher() && !is_admin()) {
+    die("Access denied.");
+}
 
 $pdo = pdo();
 $current = current_user();
-$teacher_id = $current['id'];
+
+// We'll show assignments only for the logged-in teacher (Option 1)
+$teacher_id = intval($current['id']);
+
+/* ============================
+   PROCESS ASSIGNMENTS CRUD (POST)
+   - teacher-only: teacher_id is forced to current user
+   ============================ */
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $mode = $_POST['mode'] ?? '';
+
+    if (in_array($mode, ['assignment_create','assignment_update'])) {
+        // only teacher or admin allowed to create/update here
+        if (!is_teacher() && !is_admin()) { die("Access denied."); }
+
+        $title = trim($_POST['title'] ?? '');
+        $grade = intval($_POST['grade_level'] ?? 1);
+        $id    = intval($_POST['id'] ?? 0);
+
+        $questions_json = $_POST['questions_json'] ?? '[]';
+        $decoded = json_decode($questions_json, true);
+        if (!is_array($decoded)) $questions_json = json_encode([]);
+        else {
+            $clean = [];
+            foreach ($decoded as $q) {
+                $qt = trim($q['question'] ?? '');
+                $ans = trim($q['answer'] ?? '');
+                if ($qt !== '') $clean[] = ['question'=>$qt,'answer'=>$ans];
+            }
+            $questions_json = json_encode($clean, JSON_UNESCAPED_UNICODE);
+        }
+
+        if ($title === '') {
+            $_SESSION['flash_error'] = "Title required.";
+            header("Location: ".$_SERVER['PHP_SELF']);
+            exit;
+        }
+
+        try {
+            if ($mode === 'assignment_create') {
+                $stmt = $pdo->prepare("
+                    INSERT INTO assignments (title, grade_level, teacher_id, questions_json, created_at)
+                    VALUES (:title, :grade, :tid, :q, NOW())
+                ");
+                $stmt->execute([':title'=>$title, ':grade'=>$grade, ':tid'=>$teacher_id, ':q'=>$questions_json]);
+                $_SESSION['flash_success'] = "Assignment created.";
+            } else {
+                // assignment_update - ensure the assignment belongs to this teacher
+                $stmtCheck = $pdo->prepare("SELECT teacher_id FROM assignments WHERE id=:id LIMIT 1");
+                $stmtCheck->execute([':id'=>$id]);
+                $owner = $stmtCheck->fetchColumn();
+                if (!$owner || intval($owner) !== $teacher_id) {
+                    $_SESSION['flash_error'] = "Permission denied (assignment ownership).";
+                } else {
+                    $stmt = $pdo->prepare("UPDATE assignments SET title=:title, grade_level=:grade, questions_json=:q WHERE id=:id");
+                    $stmt->execute([':title'=>$title, ':grade'=>$grade, ':q'=>$questions_json, ':id'=>$id]);
+                    $_SESSION['flash_success'] = "Assignment updated.";
+                }
+            }
+        } catch (PDOException $e) {
+            $_SESSION['flash_error'] = "DB error: ".$e->getMessage();
+        }
+
+        header("Location: ".$_SERVER['PHP_SELF']."?tab=assignments");
+        exit;
+    }
+
+    if ($mode === 'assignment_delete') {
+        if (!is_teacher() && !is_admin()) { die("Access denied."); }
+        $id = intval($_POST['id'] ?? 0);
+        if ($id) {
+            // ensure teacher owns the assignment
+            $stmtCheck = $pdo->prepare("SELECT teacher_id FROM assignments WHERE id=:id LIMIT 1");
+            $stmtCheck->execute([':id'=>$id]);
+            $owner = $stmtCheck->fetchColumn();
+            if ($owner && intval($owner) === $teacher_id) {
+                $pdo->prepare("DELETE FROM assignments WHERE id=:id")->execute([':id'=>$id]);
+                $_SESSION['flash_success'] = "Assignment deleted.";
+            } else {
+                $_SESSION['flash_error'] = "Permission denied (assignment ownership).";
+            }
+        }
+        header("Location: ".$_SERVER['PHP_SELF']."?tab=assignments");
+        exit;
+    }
+}
+
+/* ============================
+   FETCH DATA
+   - Students for this teacher (teacher_id OR same grade)
+   - Latest progress for those students
+   - Assignments that belong to this teacher only (Option 1)
+   ============================ */
+
+/* Students */
 $grade = $current['grade_level'] ?? null;
-
-// Admin can optionally view other teacher via ?tid=...
-if (is_admin() && isset($_GET['tid'])) {
-    $teacher_id = intval($_GET['tid']);
-    $stmt = $pdo->prepare("SELECT grade_level FROM teachers WHERE id=:id LIMIT 1");
-    $stmt->execute([':id'=>$teacher_id]);
-    $grade = $stmt->fetchColumn();
-}
-
-// Fetch students for this teacher (by teacher_id or grade)
-$stmt = $pdo->prepare("SELECT id,username,student_name,grade_level FROM students WHERE teacher_id = :tid OR grade_level = :g ORDER BY student_name");
+$stmt = $pdo->prepare("
+    SELECT id, username, student_name, grade_level, puzzles_completed, maze_sections, created_at
+    FROM students
+    WHERE (teacher_id = :tid) OR (grade_level = :g)
+    ORDER BY student_name ASC
+");
 $stmt->execute([':tid'=>$teacher_id, ':g'=>$grade]);
-$students = $stmt->fetchAll();
+$students = $stmt->fetchAll(PDO::FETCH_ASSOC);
+$studentCount = count($students);
 
-// For each student, fetch latest progress
-$student_progress = []; // keyed by student id
-$student_ids = array_column($students, 'id');
-
-if (!empty($student_ids)) {
-    // Prepare a query to fetch latest progress per student
-    // MySQL: select p.* where p.id = (select id from progress where student_id = p.student_id order by date_updated desc limit 1)
-    // Simpler: fetch latest per student using group by with MAX(date_updated) join
-    $in = implode(',', array_map('intval', $student_ids));
+/* Latest progress for those students */
+$progressMap = [];
+if ($studentCount > 0) {
+    $ids = implode(',', array_map('intval', array_column($students,'id')));
     $sql = "
-      SELECT p1.*
-      FROM progress p1
-      JOIN (
-        SELECT student_id, MAX(date_updated) AS mx
-        FROM progress
-        WHERE student_id IN ($in)
-        GROUP BY student_id
-      ) p2 ON p1.student_id = p2.student_id AND p1.date_updated = p2.mx
-      ORDER BY p1.student_id
+        SELECT p.student_id, p.level, p.score, p.date_updated
+        FROM progress p
+        INNER JOIN (
+            SELECT student_id, MAX(date_updated) AS maxd
+            FROM progress
+            WHERE student_id IN ($ids)
+            GROUP BY student_id
+        ) latest ON latest.student_id = p.student_id AND latest.maxd = p.date_updated
+        WHERE p.student_id IN ($ids)
     ";
-    $rows = $pdo->query($sql)->fetchAll();
-
-    foreach ($rows as $r) {
-        $student_progress[$r['student_id']] = $r;
-    }
+    try { $lastProgress = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC); } catch (Exception $e) { $lastProgress = []; }
+    foreach ($lastProgress as $r) { $progressMap[$r['student_id']] = $r; }
 }
 
-// Compute analytics
-$totalStudents = count($students);
-$withProgress = count($student_progress);
-$sumScore = 0;
-$sumLevel = 0;
-$sumTime = 0.0;
-$levelCounts = []; // level => count
-$maxLevelSeen = 0;
+/* Chart data (same as before) */
+$labels = [];
+$barData = [];
+$pieBuckets = ['Beginner'=>0,'Intermediate'=>0,'Advanced'=>0];
 
-foreach ($student_progress as $sp) {
-    $lvl = intval($sp['level']);
-    $score = intval($sp['score']);
-    $tsp = floatval($sp['time_spent']);
+foreach ($students as $s) {
+    $labels[] = $s['student_name'] ?: $s['username'];
+    $barData[] = intval($s['puzzles_completed'] ?? 0);
 
-    $sumLevel += $lvl;
-    $sumScore += $score;
-    $sumTime += $tsp;
-
-    if (!isset($levelCounts[$lvl])) $levelCounts[$lvl] = 0;
-    $levelCounts[$lvl] += 1;
-
-    if ($lvl > $maxLevelSeen) $maxLevelSeen = $lvl;
+    $lp = $progressMap[$s['id']] ?? null;
+    $lvl = $lp ? intval($lp['level']) : 0;
+    if ($lvl <= 3) $pieBuckets['Beginner']++;
+    elseif ($lvl <= 7) $pieBuckets['Intermediate']++;
+    else $pieBuckets['Advanced']++;
 }
 
-// If no progress, ensure at least level 0 bucket exists
-if (empty($levelCounts)) $levelCounts[0] = 0;
-
-$avgScore = $withProgress ? round($sumScore / $withProgress, 2) : 0;
-$avgLevel = $withProgress ? round($sumLevel / $withProgress, 2) : 0;
-$totalTime = round($sumTime, 2);
-
-// For charting, build an array from level 0..maxLevelSeen
-$maxLevelToShow = max(5, $maxLevelSeen); // show up to at least 5 levels
-$chartData = [];
-for ($i = 0; $i <= $maxLevelToShow; $i++) {
-    $chartData[$i] = $levelCounts[$i] ?? 0;
+/* Line chart data: avg score per day (30d) */
+$lineRows = [];
+if ($studentCount > 0) {
+    $ids = implode(',', array_map('intval', array_column($students,'id')));
+    $sql = "
+        SELECT DATE(date_updated) AS d, ROUND(AVG(score),2) AS avg_score
+        FROM progress
+        WHERE date_updated >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+          AND student_id IN ($ids)
+        GROUP BY DATE(date_updated)
+        ORDER BY DATE(date_updated)
+    ";
+    try { $lineRows = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC); } catch (Exception $e) { $lineRows = []; }
 }
+$lineDates = array_column($lineRows, 'd');
+$lineScores = array_map('floatval', array_column($lineRows, 'avg_score'));
 
-// CSV export support (when ?export=csv)
-if (isset($_GET['export']) && $_GET['export'] === 'csv') {
-    header('Content-Type: text/csv; charset=utf-8');
-    header('Content-Disposition: attachment; filename=progress_report_' . ($grade ?? 'all') . '.csv');
-    $out = fopen('php://output', 'w');
-    fputcsv($out, ['student_id','username','student_name','grade_level','latest_level','latest_score','time_spent','date_updated']);
-    foreach ($students as $s) {
-        $sp = $student_progress[$s['id']] ?? null;
-        fputcsv($out, [
-            $s['id'],
-            $s['username'],
-            $s['student_name'],
-            $s['grade_level'],
-            $sp ? $sp['level'] : '',
-            $sp ? $sp['score'] : '',
-            $sp ? $sp['time_spent'] : '',
-            $sp ? $sp['date_updated'] : ''
-        ]);
-    }
-    exit;
-}
+/* Assignments - ONLY those created by the logged-in teacher (Option 1) */
+$assignments = $pdo->prepare("
+    SELECT a.*, t.full_name AS teacher_name
+    FROM assignments a
+    LEFT JOIN teachers t ON a.teacher_id = t.id
+    WHERE a.teacher_id = :tid
+    ORDER BY a.created_at DESC
+");
+$assignments->execute([':tid'=>$teacher_id]);
+$assignments = $assignments->fetchAll(PDO::FETCH_ASSOC);
+
+/* flash messages */
+$flash_success = $_SESSION['flash_success'] ?? null;
+$flash_error   = $_SESSION['flash_error'] ?? null;
+unset($_SESSION['flash_success'], $_SESSION['flash_error']);
 ?>
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Teacher Dashboard — Progress Analytics</title>
+<title>Teacher Dashboard</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<!-- Favicon -->
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
+<link rel="shortcut icon" href="favicon.ico">
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
 <style>
-/* Inline theme + layout (matches previous pages) */
-*{margin:0;padding:0;box-sizing:border-box;font-family:"Poppins",Arial,sans-serif}
-body{min-height:100vh;background:#f4f6f8;color:#222;display:flex;flex-direction:column}
-
-/* NAVBAR */
-.navbar{
-  display:flex;align-items:center;gap:12px;
-  background:linear-gradient(135deg,#4f46e5,#9333ea);
-  padding:14px 20px;color:#fff;box-shadow:0 3px 12px rgba(0,0,0,.12);
+/* Basic reset & theme (keeps styling close to your admin) */
+*{box-sizing:border-box;margin:0;padding:0;font-family:"Poppins",Arial,sans-serif}
+:root{
+  --sidebar-collapsed-w:64px;
+  --sidebar-expanded-w:240px;
+  --purple-1:#4f46e5;
+  --purple-2:#9333ea;
+  --bg:#f4f6f8;
+  --card:#fff;
+  --muted:#6b7280;
 }
-.navbar img{width:36px;height:36px}
-.navbar h1{font-size:18px;font-weight:600}
-.nav-right{margin-left:auto;display:flex;gap:10px;align-items:center}
+body{background:var(--bg);display:flex;min-height:100vh}
 
-/* WRAPPER */
-.wrapper{padding:22px;flex:1;display:flex;justify-content:center}
-.container{width:100%;max-width:1200px}
+/* Sidebar */
+.sidebar{position:fixed;left:0;top:0;height:100vh;width:var(--sidebar-collapsed-w);background:linear-gradient(180deg,var(--purple-1),var(--purple-2));color:#fff;padding:18px 8px;transition:width .25s ease;overflow:hidden}
+.sidebar.expanded{width:var(--sidebar-expanded-w)}
+.logo{display:flex;align-items:center;justify-content:center;margin-bottom:18px}
+.logo img{width:40px;height:40px;border-radius:8px;background:#fff}
+.nav{display:flex;flex-direction:column;gap:16px;padding:6px}
+.nav-item{display:flex;align-items:center;gap:12px;padding:8px;border-radius:10px;cursor:pointer;color:#fff}
+.nav-item:hover{background:rgba(255,255,255,0.08)}
+.icon{width:36px;height:36;display:flex;align-items:center;justify-content:center}
+.label{display:none;white-space:nowrap}
+.sidebar.expanded .label{display:inline-block}
+.bottom{position:absolute;left:0;bottom:20px;width:100%}
+.bottom .nav-item{padding-left:12px;padding-right:12px}
 
-/* CARD */
-.card{background:#fff;padding:20px;border-radius:12px;box-shadow:0 8px 26px rgba(0,0,0,.06)}
+/* Wrapper / topbar */
+.wrapper{margin-left:var(--sidebar-collapsed-w);width:100%;padding:18px;transition:margin-left .25s ease}
+.sidebar.expanded ~ .wrapper{margin-left:var(--sidebar-expanded-w)}
+.topbar{background:linear-gradient(135deg,var(--purple-1),var(--purple-2));color:#fff;padding:14px;border-radius:8px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between}
+.topbar .right{display:flex;align-items:center;gap:12px}
+.btn{background:linear-gradient(135deg,var(--purple-1),var(--purple-2));color:#fff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+.btn-light{background:#f3f4f6;color:#111;padding:8px 10px;border-radius:8px;border:none}
 
-/* STATS ROW */
-.stats{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.stat{
-  flex:1;min-width:160px;padding:12px;border-radius:10px;border:1px solid #eef2ff;background:linear-gradient(180deg,#fff,#fbfbff);
-  text-align:center;
+/* Cards & tables */
+.card{background:var(--card);padding:18px;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.06);margin-bottom:18px}
+.table-wrap{overflow:auto}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+th,td{padding:10px;border-bottom:1px solid #eee;text-align:left}
+th{background:var(--purple-1);color:#fff}
+
+/* Assignments styling */
+.assign-form{max-width:920px;margin-top:14px}
+.assign-row{display:flex;gap:10px;align-items:center;margin-top:10px}
+.assign-row input[type="text"], .assign-row input[type="number"]{flex:1;padding:10px;border-radius:10px;border:1px solid #dbe4fb;font-size:14px;background:#fff;}
+.q-row{display:flex;gap:8px;align-items:center;margin-top:10px}
+.q-row input{flex:1;padding:10px;border-radius:8px;border:1px solid #e6e9f8}
+.q-row .btn-q-remove{background:#ef4444;border:0;color:#fff;padding:8px 10px;border-radius:8px;cursor:pointer}
+
+/* Logout Modal */
+.modal-overlay {
+    display:none;                     /* stays hidden by default */
+    position:fixed;
+    inset:0;
+    background:rgba(0,0,0,0.55);
+    backdrop-filter:blur(4px);
+    z-index:9999;
+    align-items:center;
+    justify-content:center;
 }
-.stat h4{color:#4f46e5;margin-bottom:6px}
-.stat p{font-weight:700;font-size:18px}
 
-/* CHART + LIST */
-.grid{display:grid;grid-template-columns: 1fr 420px;gap:18px}
-@media(max-width:980px){.grid{grid-template-columns: 1fr;}}
-.chart-box{padding:12px;border-radius:10px;border:1px solid #eef2ff;background:#fff}
-.list-box{padding:12px;border-radius:10px;border:1px solid #eef2ff;background:#fff;max-height:520px;overflow:auto}
 
-/* STUDENT ROW */
-.student-row{display:flex;justify-content:space-between;align-items:center;padding:10px;border-bottom:1px solid #f1f5ff}
-.student-left{display:flex;flex-direction:column}
-.student-name{font-weight:700}
-.student-meta{font-size:13px;color:#666}
+.modal-box {
+    width:90%;
+    max-width:420px;
 
-/* CHART: simple SVG bar chart styles */
-.s-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-.s-legend span{font-size:13px;color:#333;background:#f8f8ff;padding:6px 10px;border-radius:8px;border:1px solid #e9e6ff}
+    background:#fff;
+    padding:24px;
+    border-radius:16px;
+    text-align:center;
+    box-shadow:0 8px 25px rgba(0,0,0,0.25);
 
-/* ACTIONS */
-.actions{display:flex;gap:10px;margin-bottom:12px}
-.btn{
-  padding:8px 12px;border-radius:8px;background:linear-gradient(135deg,#4f46e5,#9333ea);color:#fff;text-decoration:none;font-size:14px;
-}
-.btn-alt{background:#fff;border:1px solid #e6e6f7;color:#333}
-
-/* PRINTABLE REPORT */
-#print-area{display:none} /* not visible in UI; used for print */
-@media print {
-  body *{visibility:hidden}
-  #print-area, #print-area *{visibility:visible}
-  #print-area{position:fixed;left:0;top:0;width:100%}
+    animation:fadeInScale .25s ease-out;
 }
 
-/* LOGOUT MODAL (re-usable) */
-.modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.4);display:none;justify-content:center;align-items:center;z-index:9999}
-.modal-box{width:92%;max-width:360px;background:#fff;padding:20px;border-radius:12px;box-shadow:0 10px 35px rgba(0,0,0,.15)}
-.modal-actions{display:flex;gap:10px;margin-top:16px}
-.modal-actions .btn-confirm{flex:1;padding:10px;border:none;border-radius:8px;background:linear-gradient(135deg,#4f46e5,#9333ea);color:#fff}
-.modal-actions .btn-cancel{flex:1;padding:10px;border-radius:8px;background:#f3f4f6;border:none}
+.modal-actions {
+    margin-top:18px;
+    display:flex;
+    justify-content:center;
+    gap:12px;
+}
+/* Fix Actions column header & cell alignment */
+th.actions-col, td.actions-col {
+    text-align: center !important;
+    width: 150px;   /* adjust if needed */
+    white-space: nowrap;
+}
+
+
+@keyframes fadeInScale {
+    from { transform:scale(0.85); opacity:0; }
+    to   { transform:scale(1); opacity:1; }
+}
+
+/* Reports output */
+.report-output{margin-top:20px;background:#fff;padding:18px;border-radius:12px;min-height:150px;box-shadow:0 4px 12px rgba(0,0,0,0.06)}
+
+/* Analytics sizing */
+.chart-card { min-height: 320px; display:flex; align-items:center; justify-content:center; padding:12px; }
+.chart-card canvas { width:100% !important; height:320px !important; display:block; }
+
+/* Responsive */
+@media (max-width:900px){
+  .sidebar{transform:translateX(-110%);position:fixed}
+  .sidebar.open{transform:translateX(0)}
+  .wrapper{margin-left:0;padding:12px}
+}
 </style>
 </head>
 <body>
+<!-- SIDEBAR -->
+<aside id="sidebar" class="sidebar" role="navigation" aria-label="Main navigation">
+  <div class="logo"><img src="favicon-32x32.png" alt="logo"></div>
 
-<!-- NAVBAR -->
-<header class="navbar">
-  <img src="favicon-32x32.png" alt="" onerror="this.style.display='none'">
-  <h1>MathMaze — Teacher</h1>
-  <div class="nav-right">
-    <div style="font-size:14px;opacity:.95"><?=htmlspecialchars($current['name'] ?? $current['username'])?></div>
-    <a class="btn" href="assignments.php" style="text-decoration:none">Assignments</a>
-    <a class="btn" href="#" onclick="openLogoutModal()">Logout</a>
+  <nav class="nav" aria-label="Sidebar menu">
+    <div class="nav-item" onclick="showTab('overview')">
+      <div class="icon"><i class="fa-solid fa-gauge"></i></div><div class="label">Dashboard</div>
+    </div>
+
+    <div class="nav-item" onclick="showTab('students')">
+      <div class="icon"><i class="fa-solid fa-users"></i></div><div class="label">Students</div>
+    </div>
+
+    <div class="nav-item" onclick="showTab('analytics')">
+      <div class="icon"><i class="fa-solid fa-chart-pie"></i></div><div class="label">Analytics</div>
+    </div>
+
+    <div class="nav-item" onclick="showTab('assignments')">
+      <div class="icon"><i class="fa-solid fa-book"></i></div><div class="label">Assignments</div>
+    </div>
+
+    <div class="nav-item" onclick="showTab('reports')">
+      <div class="icon"><i class="fa-solid fa-file-lines"></i></div><div class="label">Reports</div>
+    </div>
+  </nav>
+
+  <div class="bottom">
+    <div class="nav-item" onclick="toggleSidebar()"><div class="icon"><i class="fa-solid fa-angles-left"></i></div><div class="label">Collapse</div></div>
+    <div class="nav-item" onclick="openLogoutModal()"><div class="icon"><i class="fa-solid fa-right-from-bracket"></i></div><div class="label">Logout</div></div>
   </div>
-</header>
+</aside>
 
 <!-- MAIN -->
-<div class="wrapper">
-  <div class="container">
+<div class="wrapper" id="wrapper">
+  <div class="topbar">
+    <div style="font-weight:700;font-size:18px">Teacher Dashboard</div>
+    <div class="right">
+      <div style="color:#fff">Hello, <?=htmlspecialchars($current['name'] ?? $current['username'])?></div>
+      <button class="btn" onclick="openLogoutModal()">Logout</button>
+    </div>
+  </div>
 
-    <!-- Top: actions -->
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <h2 style="font-size:20px;margin-bottom:6px">Student Progress — Grade <?=intval($grade)?></h2>
-      <div class="actions">
-        <a class="btn" href="?export=csv">Export CSV</a>
-        <a class="btn btn-alt" href="#" onclick="openPrintReport();return false">Print Report</a>
+  <!-- OVERVIEW -->
+  <div id="overview" class="tab">
+    <div class="card">
+      <h2>Overview</h2>
+      <div style="display:flex;gap:12px;margin-top:12px;flex-wrap:wrap">
+        <div style="flex:1" class="card"><div style="color:var(--muted)">My Students</div><div style="font-size:22px;font-weight:700"><?=intval($studentCount)?></div></div>
+        <div style="flex:1" class="card"><div style="color:var(--muted)">Avg Score (30d)</div><div style="font-size:22px;font-weight:700"><?=count($lineScores) ? round(array_sum($lineScores)/count($lineScores),2) : 0?></div></div>
+        <div style="flex:1" class="card"><div style="color:var(--muted)">Total Puzzles</div><div style="font-size:22px;font-weight:700"><?=array_sum($barData)?></div></div>
+        <div style="flex:1" class="card"><div style="color:var(--muted)">Active Days</div><div style="font-size:22px;font-weight:700"><?=count($lineRows)?></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STUDENTS -->
+  <div id="students" class="tab" style="display:none">
+    <div class="card">
+      <h2>Students</h2>
+      <p style="color:var(--muted);margin-bottom:10px">Select students to bulk print reports or export CSV.</p>
+
+      <div style="display:flex;gap:10px;margin-bottom:12px">
+        <button class="btn" id="printSelectedBtn"><i class="fa-solid fa-print"></i> Print Selected</button>
+        <button class="btn-light" id="exportCsvBtn"><i class="fa-solid fa-file-csv"></i> Export CSV</button>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th><input type="checkbox" id="checkAll"></th><th>ID</th><th>Username</th><th>Name</th><th>Grade</th><th>Level</th><th>Score</th><th>Puzzles</th><th class="actions-col">Actions</th>
+</tr>
+          </thead>
+          <tbody>
+            <?php foreach ($students as $s):
+                $lp = $progressMap[$s['id']] ?? null;
+                $level = $lp ? intval($lp['level']) : 0;
+                $score = $lp ? intval($lp['score']) : 0;
+            ?>
+            <tr>
+              <td><input type="checkbox" class="sel" name="sid[]" value="<?=intval($s['id'])?>"></td>
+              <td><?=intval($s['id'])?></td>
+              <td><?=htmlspecialchars($s['username'])?></td>
+              <td><?=htmlspecialchars($s['student_name'])?></td>
+              <td><?=intval($s['grade_level'])?></td>
+              <td><?=intval($level)?></td>
+              <td><?=intval($score)?></td>
+              <td><?=intval($s['puzzles_completed'] ?? 0)?></td>
+              <td>
+                <a class="btn-light" href="student_report.php?id=<?=intval($s['id'])?>" target="_blank" rel="noopener">View</a>
+                <a class="btn" href="student_report.php?id=<?=intval($s['id'])?>&print=1" target="_blank" rel="noopener">Print</a>
+              </td>
+            </tr>
+            <?php endforeach; ?>
+            <?php if (empty($students)): ?>
+              <tr><td colspan="9" style="text-align:center;padding:16px;color:var(--muted)">No students found.</td></tr>
+            <?php endif; ?>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ANALYTICS -->
+  <div id="analytics" class="tab" style="display:none">
+    <div class="card">
+      <h2>Analytics</h2>
+      <div class="charts" style="margin-top:12px; display:flex; gap:18px; flex-wrap:wrap;">
+        <div class="chart-card" style="flex-basis:48%;">
+            <canvas id="pieChart" aria-label="Pie chart" role="img"></canvas>
+        </div>
+
+        <div class="chart-card" style="flex-basis:48%;">
+            <canvas id="barChart" aria-label="Bar chart" role="img"></canvas>
+        </div>
+
+        <div class="chart-card" style="flex-basis:100%; margin-top:18px;">
+            <canvas id="lineChart" aria-label="Line chart" role="img"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ASSIGNMENTS (teacher-only) -->
+  <div id="assignments" class="tab" style="display:none">
+    <div class="card" style="display:flex;justify-content:space-between;align-items:center">
+      <h2>Assignments</h2>
+      <div><button class="btn" onclick="openAssignmentCreate()">New Assignment</button></div>
+    </div>
+
+    <?php if ($flash_success): ?><div class="card" style="background:#d1fae5;color:#064e3b;margin-bottom:12px;"><?=htmlspecialchars($flash_success)?></div><?php endif; ?>
+    <?php if ($flash_error): ?><div class="card" style="background:#fff1f2;color:#7f1d1d;margin-bottom:12px;"><?=htmlspecialchars($flash_error)?></div><?php endif; ?>
+
+    <div id="assignment-list" class="card">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>ID</th><th>Title</th><th>Grade</th><th>Created</th><th>Actions</th></tr></thead>
+          <tbody>
+            <?php if (empty($assignments)): ?>
+              <tr><td colspan="5" style="text-align:center;padding:18px;color:var(--muted)">You have no assignments yet.</td></tr>
+            <?php else: foreach ($assignments as $a): ?>
+              <tr>
+                <td><?=intval($a['id'])?></td>
+                <td><?=htmlspecialchars($a['title'])?></td>
+                <td><?=intval($a['grade_level'])?></td>
+                <td><?=htmlspecialchars($a['created_at'])?></td>
+                <td class="actions-col">
+                  <?php $js = json_encode($a, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT); ?>
+                  <button class="btn-light" onclick='openAssignmentEdit(<?= $js ?>)'>Edit</button>
+                  <button class="btn" onclick="deleteAssignment(<?= intval($a['id']) ?>)">Delete</button>
+                </td>
+              </tr>
+            <?php endforeach; endif; ?>
+          </tbody>
+        </table>
       </div>
     </div>
 
-    <div class="card">
+    <!-- Assignment Form -->
+    <div id="assignment-form" class="card" style="display:none">
+      <form id="frmAssignment" method="post" onsubmit="return submitAssignmentForm();">
+        <input type="hidden" name="mode" id="modeField" value="assignment_create">
+        <input type="hidden" name="id" id="assignmentId">
+        <input type="hidden" name="questions_json" id="questionsJson">
 
-      <!-- STATS -->
-      <div class="stats" style="margin-bottom:18px">
-        <div class="stat">
-          <h4>Total students</h4>
-          <p><?=$totalStudents?></p>
-        </div>
-        <div class="stat">
-          <h4>Students with progress</h4>
-          <p><?=$withProgress?></p>
-        </div>
-        <div class="stat">
-          <h4>Average level</h4>
-          <p><?=$avgLevel?></p>
-        </div>
-        <div class="stat">
-          <h4>Average score</h4>
-          <p><?=$avgScore?></p>
-        </div>
-        <div class="stat">
-          <h4>Total time (min)</h4>
-          <p><?=$totalTime?></p>
-        </div>
-      </div>
-
-      <div class="grid">
-        <!-- Chart -->
-        <div class="chart-box">
-          <h3 style="margin-bottom:8px">Level distribution</h3>
-          <?php
-          // compute chart dimensions
-          $maxCount = max($chartData) ?: 1;
-          $barMaxHeight = 160;
-          ?>
-          <svg width="100%" height="200" viewBox="0 0 600 200" preserveAspectRatio="xMidYMid meet" style="width:100%;height:200px">
-            <?php
-            $cols = count($chartData);
-            $colWidth = floor(560 / max(1, $cols));
-            $x = 20;
-            $i = 0;
-            foreach ($chartData as $level => $count):
-              $h = ($count / $maxCount) * $barMaxHeight;
-              $y = 180 - $h;
-              $rx = 8; // rounded corner on rect via rx
-              $color = '#7c3aed';
-            ?>
-              <!-- bar -->
-              <rect x="<?=$x?>" y="<?=$y?>" width="<?=($colWidth-8)?>" height="<?=$h?>" rx="6" fill="<?=$color?>" opacity="0.95"></rect>
-              <!-- label: level -->
-              <text x="<?=$x + ($colWidth/2)?>" y="196" font-size="12" text-anchor="middle" fill="#333"><?=$level?></text>
-              <!-- value -->
-              <text x="<?=$x + ($colWidth/2)?>" y="<?=$y - 6?>" font-size="12" text-anchor="middle" fill="#333"><?=intval($count)?></text>
-            <?php
-              $x += $colWidth;
-              $i++;
-            endforeach;
-            ?>
-          </svg>
-
-          <div class="s-legend" style="margin-top:10px">
-            <?php foreach ($chartData as $lvl => $cnt): ?>
-              <span>Level <?=$lvl?> — <?=$cnt?> student<?=($cnt==1?'':'s')?></span>
-            <?php endforeach; ?>
+        <div style="display:flex;gap:14px;align-items:flex-end">
+          <div style="flex:1">
+            <label style="display:block;font-weight:700;margin-bottom:6px">Title</label>
+            <input type="text" id="assignmentTitle" name="title" style="width:100%;padding:10px;border-radius:8px;border:1px solid #e6e9fb" required>
+          </div>
+          <div style="width:160px">
+            <label style="display:block;font-weight:700;margin-bottom:6px">Grade</label>
+            <input type="number" id="assignmentGrade" name="grade_level" class="small-input" min="1" max="12" value="3" style="width:100%;padding:10px;border-radius:8px;border:1px solid #e6e9fb">
           </div>
         </div>
 
-        <!-- Student list with latest progress -->
-        <div class="list-box">
-          <h3 style="margin-bottom:10px">Students (latest progress)</h3>
-          <?php if ($students): foreach ($students as $s): 
-              $sp = $student_progress[$s['id']] ?? null;
-          ?>
-            <div class="student-row">
-              <div class="student-left">
-                <div class="student-name"><?=htmlspecialchars($s['student_name'])?> <span style="font-size:12px;color:#666"> (<?=htmlspecialchars($s['username'])?>)</span></div>
-                <div class="student-meta">Grade <?=intval($s['grade_level'])?></div>
-              </div>
-              <div style="text-align:right">
-                <?php if ($sp): ?>
-                  <div style="font-weight:700">Level <?=intval($sp['level'])?></div>
-                  <div style="font-size:13px;color:#666">Score: <?=intval($sp['score'])?> — <?=htmlspecialchars($sp['date_updated'])?></div>
-                <?php else: ?>
-                  <div style="color:#666">No progress</div>
-                <?php endif; ?>
-              </div>
-            </div>
-          <?php endforeach; else: ?>
-            <div style="padding:12px;color:#666">No students found.</div>
-          <?php endif; ?>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
+          <div style="font-weight:600">Questions</div>
+          <div>
+            <button type="button" class="btn" onclick="addQuestionRow()">Add</button>
+            <button type="button" class="btn-light" onclick="fillSample()" style="margin-left:8px">Sample</button>
+          </div>
+        </div>
+
+        <div id="questionsContainer" style="margin-top:12px"></div>
+
+        <div style="display:flex;gap:12px;margin-top:18px">
+          <button type="submit" class="btn" style="flex:1">Save Assignment</button>
+          <button type="button" class="btn-light" style="flex:1" onclick="closeAssignmentForm()">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- REPORTS -->
+  <div id="reports" class="tab" style="display:none">
+    <div class="card">
+      <h2>Reports</h2>
+      <div style="margin-top:12px">
+        <h3 style="margin-bottom:10px">Available Reports</h3>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <button class="btn" onclick="showReport('student_progress')">Student Progress Report</button>
+          <button class="btn" onclick="showReport('grade_summary')">Grade Summary Report</button>
+          <button class="btn" onclick="showReport('assignment_performance')">Assignment Performance Report</button>
+        </div>
+
+        <div id="reportOutput" class="report-output">
+          <em>Select a report to generate…</em>
         </div>
       </div>
     </div>
   </div>
-</div>
 
-<!-- PRINT AREA (visible only in print) -->
-<div id="print-area" style="padding:20px">
-  <h1 style="color:#4f46e5">MathMaze — Progress Report</h1>
-  <p>Teacher: <?=htmlspecialchars($current['name'] ?? $current['username'])?> — Grade <?=intval($grade)?> — Generated: <?=date('Y-m-d H:i')?></p>
+</div> <!-- end wrapper -->
 
-  <h3>Summary</h3>
-  <table style="width:100%;border-collapse:collapse;margin-bottom:12px">
-    <tr><td>Total students</td><td><?=$totalStudents?></td></tr>
-    <tr><td>Students with progress</td><td><?=$withProgress?></td></tr>
-    <tr><td>Average level</td><td><?=$avgLevel?></td></tr>
-    <tr><td>Average score</td><td><?=$avgScore?></td></tr>
-    <tr><td>Total time (min)</td><td><?=$totalTime?></td></tr>
-  </table>
-
-  <h3>Students (latest)</h3>
-  <table style="width:100%;border-collapse:collapse" border="1">
-    <thead><tr><th>ID</th><th>Username</th><th>Name</th><th>Grade</th><th>Level</th><th>Score</th><th>Time</th><th>Updated</th></tr></thead>
-    <tbody>
-    <?php foreach ($students as $s): $sp = $student_progress[$s['id']] ?? null; ?>
-      <tr>
-        <td><?=intval($s['id'])?></td>
-        <td><?=htmlspecialchars($s['username'])?></td>
-        <td><?=htmlspecialchars($s['student_name'])?></td>
-        <td><?=intval($s['grade_level'])?></td>
-        <td><?= $sp ? intval($sp['level']) : '-' ?></td>
-        <td><?= $sp ? intval($sp['score']) : '-' ?></td>
-        <td><?= $sp ? htmlspecialchars($sp['time_spent']) : '-' ?></td>
-        <td><?= $sp ? htmlspecialchars($sp['date_updated']) : '-' ?></td>
-      </tr>
-    <?php endforeach; ?>
-    </tbody>
-  </table>
-</div>
-
-<!-- LOGOUT MODAL (reusable snippet) -->
+<!-- LOGOUT MODAL -->
 <div id="logoutModal" class="modal-overlay">
   <div class="modal-box">
-    <h3 style="color:#4f46e5">Log Out?</h3>
+    <h3>Log Out?</h3>
     <p>Are you sure you want to log out?</p>
+
     <div class="modal-actions">
-      <button class="btn-confirm" onclick="confirmLogout()">Log Out</button>
-      <button class="btn-cancel" onclick="closeLogoutModal()">Cancel</button>
+      <button class="btn" onclick="window.location='logout.php'">Log Out</button>
+      <button class="btn-light" onclick="closeLogoutModal()">Cancel</button>
     </div>
   </div>
 </div>
 
+
 <script>
-// Modal functions
+// single showTab + initial tab loader + analytics redraw
+function showTab(tabId){
+  document.querySelectorAll('.tab').forEach(n=>n.style.display='none');
+  const el = document.getElementById(tabId);
+  if(el) el.style.display = 'block';
+  window.scrollTo({top:0,behavior:'smooth'});
+
+  if (tabId === 'analytics') {
+    // small timeout to ensure canvas is visible and layout settled
+    setTimeout(() => {
+      if (window.pieChart && typeof window.pieChart.resize === 'function') window.pieChart.resize();
+      if (window.barChart && typeof window.barChart.resize === 'function') window.barChart.resize();
+      if (window.lineChart && typeof window.lineChart.resize === 'function') window.lineChart.resize();
+    }, 120);
+  }
+}
+(function(){ const t = (new URLSearchParams(location.search)).get('tab') || 'overview'; showTab(t); })();
+
+// --- Sidebar toggle ---
+const sidebar = document.getElementById('sidebar');
+function toggleSidebar(){ sidebar.classList.toggle('expanded'); }
+
+// --- Logout modal ---
 function openLogoutModal(){ document.getElementById('logoutModal').style.display = 'flex'; }
 function closeLogoutModal(){ document.getElementById('logoutModal').style.display = 'none'; }
-function confirmLogout(){ window.location.href = 'logout.php'; }
 
-// Print report: scroll to print area then call window.print()
-function openPrintReport(){
-  // temporarily show print area, hide modal/backdrop
-  window.print();
+// --- Students: checkAll / print / csv ---
+document.addEventListener('DOMContentLoaded', function(){
+
+  // checkAll
+  const checkAll = document.getElementById('checkAll');
+  if (checkAll) {
+    checkAll.addEventListener('change', function(){
+      const checked = this.checked;
+      document.querySelectorAll('.sel').forEach(cb => cb.checked = checked);
+    });
+  }
+
+  // print selected
+  const printBtn = document.getElementById('printSelectedBtn');
+  if (printBtn) {
+    printBtn.addEventListener('click', function(){
+      const selected = Array.from(document.querySelectorAll('.sel:checked')).map(cb => cb.value);
+      if (selected.length === 0) { alert('No students selected.'); return; }
+      selected.forEach(id => window.open('student_report.php?id=' + encodeURIComponent(id) + '&print=1','_blank','noopener'));
+    });
+  }
+
+  // export CSV
+  const exportBtn = document.getElementById('exportCsvBtn');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', function(){
+      const headers = ['id','username','student_name','grade','level','score','puzzles'];
+      const rows = [headers.join(',')];
+      document.querySelectorAll('.sel:checked').forEach(cb => {
+        const tr = cb.closest('tr');
+        if (!tr) return;
+        const id = tr.children[1].innerText.trim();
+        const username = tr.children[2].innerText.trim().replace(/,/g,'');
+        const name = tr.children[3].innerText.trim().replace(/,/g,'');
+        const grade = tr.children[4].innerText.trim();
+        const level = tr.children[5].innerText.trim();
+        const score = tr.children[6].innerText.trim();
+        const puzzles = tr.children[7].innerText.trim();
+        rows.push([id, username, name, grade, level, score, puzzles].join(','));
+      });
+      if (rows.length <= 1) { alert('No students selected.'); return; }
+      const blob = new Blob([rows.join('\n')], {type: 'text/csv'}), url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'students_export.csv'; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    });
+  }
+
+  /* Charts (Chart.js) */
+
+  // data from PHP
+  var pieLabels = <?=json_encode(array_keys($pieBuckets), JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?>;
+  var pieData = <?=json_encode(array_values($pieBuckets))?>;
+  var studentLabels = <?=json_encode($labels, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?>;
+  var barData = <?=json_encode($barData)?>;
+  var lineDates = <?=json_encode($lineDates)?>;
+  var lineScores = <?=json_encode($lineScores)?>;
+
+  // Pie
+  const pieCtxEl = document.getElementById('pieChart');
+  if (pieCtxEl) {
+    const pieCtx = pieCtxEl.getContext('2d');
+    window.pieChart = new Chart(pieCtx, {
+      type:'pie',
+      data:{ labels:pieLabels, datasets:[{ data:pieData, backgroundColor:['#60a5fa','#ec4899','#f59e0b'] }] },
+      options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{position:'top'}} }
+    });
+  }
+
+  // Bar
+  const barCtxEl = document.getElementById('barChart');
+  if (barCtxEl) {
+    const barCtx = barCtxEl.getContext('2d');
+    window.barChart = new Chart(barCtx, {
+      type:'bar',
+      data:{ labels:studentLabels, datasets:[{ label:'Puzzles completed', data:barData, backgroundColor:'#7c3aed' }] },
+      options:{ responsive:true, maintainAspectRatio:false, scales:{x:{ticks:{maxRotation:45,minRotation:0}}} }
+    });
+  }
+
+  // Line
+  const lineCtxEl = document.getElementById('lineChart');
+  if (lineCtxEl) {
+    const lineCtx = lineCtxEl.getContext('2d');
+    window.lineChart = new Chart(lineCtx, {
+      type:'line',
+      data:{ labels:lineDates, datasets:[{ label:'Average score (last 30 days)', data:lineScores, borderColor:'#3b82f6', fill:false, tension:0.2 }] },
+      options:{ responsive:true, maintainAspectRatio:false, scales:{x:{title:{display:true,text:'Date'}}, y:{title:{display:true,text:'Avg Score'}}} }
+    });
+  }
+
+}); // DOMContentLoaded
+
+// --- Assignments UI ---
+function openAssignmentCreate(){
+  document.getElementById('assignment-list').style.display = 'none';
+  document.getElementById('assignment-form').style.display = 'block';
+  document.getElementById('modeField').value = 'assignment_create';
+  document.getElementById('assignmentId').value = '';
+  document.getElementById('assignmentTitle').value = '';
+  document.getElementById('assignmentGrade').value = '3';
+  document.getElementById('questionsContainer').innerHTML = '';
+  addQuestionRow();
+  window.scrollTo({top:0,behavior:'smooth'});
 }
-</script>
+function openAssignmentEdit(a){
+  let questions = [];
+  try { questions = (typeof a.questions_json === 'string') ? JSON.parse(a.questions_json) : (a.questions_json || []); }
+  catch(e){ questions = []; }
+  document.getElementById('assignment-list').style.display = 'none';
+  document.getElementById('assignment-form').style.display = 'block';
+  document.getElementById('modeField').value = 'assignment_update';
+  document.getElementById('assignmentId').value = a.id || '';
+  document.getElementById('assignmentTitle').value = a.title || '';
+  document.getElementById('assignmentGrade').value = a.grade_level || '3';
+  const container = document.getElementById('questionsContainer'); container.innerHTML = '';
+  if (!questions.length) addQuestionRow(); else questions.forEach(q => addQuestionRow(q.question || '', q.answer || ''));
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+function closeAssignmentForm(){
+  document.getElementById('assignment-form').style.display = 'none';
+  document.getElementById('assignment-list').style.display = 'block';
+}
+function addQuestionRow(q='', a=''){
+  const container = document.getElementById('questionsContainer');
+  const row = document.createElement('div'); row.className = 'q-row'; row.style.alignItems = 'center';
+  const qInput = document.createElement('input'); qInput.type='text'; qInput.className='q-question'; qInput.placeholder='Question (e.g. What is 2 + 2?)'; qInput.value = q;
+  const aInput = document.createElement('input'); aInput.type='text'; aInput.className='q-answer'; aInput.placeholder='Answer (optional)'; aInput.value = a;
+  const btn = document.createElement('button'); btn.type='button'; btn.className='btn-q-remove'; btn.textContent='Remove'; btn.onclick=function(){row.remove();};
+  row.appendChild(qInput); row.appendChild(aInput); row.appendChild(btn); container.appendChild(row);
+}
+function fillSample(){ const c=document.getElementById('questionsContainer'); c.innerHTML=''; addQuestionRow('What is 5 + 3?','8'); addQuestionRow('What is 9 - 4?','5'); addQuestionRow('How many sides does a triangle have?','3'); }
+function submitAssignmentForm(){
+  const qs = [];
+  document.querySelectorAll('#questionsContainer .q-row').forEach(r=>{
+    const q = (r.querySelector('.q-question') || {}).value || '';
+    const a = (r.querySelector('.q-answer') || {}).value || '';
+    if (q.trim() !== '') qs.push({question:q.trim(), answer:a.trim()});
+  });
+  document.getElementById('questionsJson').value = JSON.stringify(qs);
+  return true; // allow form submit
+}
+function deleteAssignment(id){
+  if (!confirm('Delete this assignment?')) return;
+  const form = document.createElement('form');
+  form.method='POST';
+  form.innerHTML = '<input type="hidden" name="mode" value="assignment_delete"><input type="hidden" name="id" value="'+id+'">';
+  document.body.appendChild(form); form.submit();
+}
 
+// --- Reports loader ---
+function showReport(type){
+    const box = document.getElementById("reportOutput");
+    box.innerHTML = "<em>Generating report...</em>";
+
+    fetch("report_generator.php?type=" + encodeURIComponent(type) + "&teacher=1")
+    .then(r => r.text())
+    .then(html => box.innerHTML = html)
+    .catch(() => box.innerHTML = "<b>Error loading report.</b>");
+}
+
+</script>
 </body>
 </html>
